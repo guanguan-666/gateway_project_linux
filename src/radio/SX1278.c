@@ -8,6 +8,7 @@
 
 #include "SX1278.h"
 #include <string.h>
+#include <stdlib.h>
 
 uint8_t SX1278_SPIRead(SX1278_t *module, uint8_t addr) {
 uint8_t tx[2] = { addr & 0x7F, 0x00 }; // 地址最高位清0表示读
@@ -27,34 +28,52 @@ uint8_t tx[2] = { addr | 0x80, cmd }; // 地址最高位置1表示写
     SX1278_hw_SPITransfer(module->hw, tx, rx, 2);
 }
 
-void SX1278_SPIBurstRead(SX1278_t *module, uint8_t addr, uint8_t *rxBuf,
-		uint8_t length) {
-	uint8_t i;
-	if (length <= 1) {
-		return;
-	} else {
-		SX1278_hw_SetNSS(module->hw, 0);
-		SX1278_hw_SPICommand(module->hw, addr);
-		for (i = 0; i < length; i++) {
-			*(rxBuf + i) = SX1278_hw_SPIReadByte(module->hw);
-		}
-		SX1278_hw_SetNSS(module->hw, 1);
-	}
+void SX1278_SPIBurstRead(SX1278_t *module, uint8_t addr, uint8_t *rxBuf, uint8_t length) {
+    if (length == 0) return;
+
+    // 1. 准备发送缓冲区：[地址(1byte)] + [填充0x00(length bytes)]
+    // 因为是 Read，地址最高位要是 0 (addr & 0x7F)
+    uint8_t *tx_temp = (uint8_t *)malloc(length + 1);
+    uint8_t *rx_temp = (uint8_t *)malloc(length + 1);
+
+    if (!tx_temp || !rx_temp) {
+        printf("Error: Malloc failed in SPIBurstRead\n");
+        return;
+    }
+
+    memset(tx_temp, 0, length + 1);
+    tx_temp[0] = addr & 0x7F; // 设置读地址
+
+    // 2. 执行一次性全双工传输
+    // CS 会在整个传输过程中一直保持拉低，这是正确的
+    SX1278_hw_SPITransfer(module->hw, tx_temp, rx_temp, length + 1);
+
+    // 3. 提取数据
+    // rx_temp[0] 是发送地址时 MISO 的状态（通常无效），数据从 rx_temp[1] 开始
+    memcpy(rxBuf, &rx_temp[1], length);
+
+    free(tx_temp);
+    free(rx_temp);
 }
 
-void SX1278_SPIBurstWrite(SX1278_t *module, uint8_t addr, uint8_t *txBuf,
-		uint8_t length) {
-	unsigned char i;
-	if (length <= 1) {
-		return;
-	} else {
-		SX1278_hw_SetNSS(module->hw, 0);
-		SX1278_hw_SPICommand(module->hw, addr | 0x80);
-		for (i = 0; i < length; i++) {
-			SX1278_hw_SPICommand(module->hw, *(txBuf + i));
-		}
-		SX1278_hw_SetNSS(module->hw, 1);
-	}
+void SX1278_SPIBurstWrite(SX1278_t *module, uint8_t addr, uint8_t *txBuf, uint8_t length) {
+    if (length == 0) return;
+
+    // 1. 准备发送缓冲区：[地址(1byte)] + [数据(length bytes)]
+    // 因为是 Write，地址最高位要是 1 (addr | 0x80)
+    uint8_t *tx_temp = (uint8_t *)malloc(length + 1);
+    uint8_t *rx_temp = (uint8_t *)malloc(length + 1); // 接收缓冲区用于占位
+
+    if (!tx_temp || !rx_temp) return;
+
+    tx_temp[0] = addr | 0x80; // 设置写地址
+    memcpy(&tx_temp[1], txBuf, length); // 拷贝要发送的数据
+
+    // 2. 执行一次性传输
+    SX1278_hw_SPITransfer(module->hw, tx_temp, rx_temp, length + 1);
+
+    free(tx_temp);
+    free(rx_temp);
 }
 
 void SX1278_config(SX1278_t *module) {
