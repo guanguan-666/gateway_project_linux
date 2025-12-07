@@ -10,6 +10,7 @@
 #include <signal.h> 
 #include "linux-hal.h"
 #include "SX1278.h"
+#include "db_manager.h" // 引入数据库头文件
 
 #define PIN_RESET  119 
 #define PIN_DIO0   116 
@@ -20,10 +21,24 @@ uint32_t g_total_lost = 0;
 uint32_t g_last_seq = 0;
 int      g_is_first = 1;
 
-void sig_handler(int signo) { if (signo == SIGINT) g_running = 0; }
+// --- [修正1] 唯一的信号处理函数 ---
+// 包含了数据库关闭逻辑，请确保文件中只有这一个 sig_handler
+void sig_handler(int signo) { 
+    if (signo == SIGINT) {
+        g_running = 0;
+        printf("\n[Info] Exiting... Closing DB.\n");
+        db_close(); 
+    }
+}
 
 int main() {
     signal(SIGINT, sig_handler);
+
+    // 初始化数据库
+    if (db_init("sensor_data.db") != 0) {
+        printf("[ERR] Database Init Failed!\n");
+        return -1;
+    }
 
     printf("\n=== LoRa Gateway (Manual Parsing Mode) ===\n");
     printf("Expected Protocol: [AA] [ID] [T1 T2 T3 T4] [S1 S2 S3 S4] (10 Bytes)\n");
@@ -52,11 +67,10 @@ int main() {
 
                 // 1. 基础校验
                 if (len == 10 && buf[0] == 0xAA) {
-                    // --- 手动解析 (与 STM32 发送顺序严格对应) ---
-                    // ID: buf[1]
-                    // Temp: buf[2]..buf[5]
-                    // Seq:  buf[6]..buf[9]
                     
+                    // --- [修正2] 定义并提取 dev_id ---
+                    uint8_t dev_id = buf[1]; 
+
                     float temp;
                     memcpy(&temp, &buf[2], 4); 
 
@@ -70,13 +84,11 @@ int main() {
                         g_is_first = 0;
                         g_last_seq = seq;
                     } else {
-                        // 正常情况：seq 应该比 last_seq 大 1
                         if (seq > g_last_seq + 1) {
                             int lost = seq - g_last_seq - 1;
                             g_total_lost += lost;
                             printf("\n[WARN] Lost %d pkts (Seq %d -> %d)\n", lost, g_last_seq, seq);
                         } 
-                        // 重启情况
                         else if (seq < g_last_seq) {
                             printf("\n[INFO] Device Restarted. Stats Reset.\n");
                             g_total_lost = 0;
@@ -91,17 +103,16 @@ int main() {
                     if(g_total_recv + g_total_lost > 0)
                         rate = (float)g_total_lost / (g_total_recv + g_total_lost) * 100.0f;
 
-                    // 打印数据，并在末尾附带原始 HEX 供查错
-                    printf("\rSeq:%-5d | Temp:%-6.2f | Loss:%-3d (%.1f%%) | RAW: %02X %02X %02X %02X...  ", 
-                           seq, temp, g_total_lost, rate, buf[6], buf[7], buf[8], buf[9]);
+                    printf("\rSeq:%-5d | Temp:%-6.2f | Loss:%-3d (%.1f%%) | RAW: %02X %02X...  ", 
+                           seq, temp, g_total_lost, rate, buf[6], buf[7]);
                     fflush(stdout);
 
+                    // --- 存入数据库 ---
+                    // 现在 dev_id 已经定义了，这里就不会报错了
+                    db_insert_data(dev_id, temp, seq, g_total_lost);
+
                 } else {
-                    // 异常数据打印
                     printf("\n[ERR] Invalid Packet. Len:%d, Head:0x%02X\n", len, buf[0]);
-                    printf("      Hex: ");
-                    for(int i=0; i<len; i++) printf("%02X ", buf[i]);
-                    printf("\n");
                 }
                 
                 SX1278_LoRaEntryRx(&sx1278, 10, 0);
@@ -109,5 +120,8 @@ int main() {
             usleep(2000); 
         }
     } 
+    
+    // 退出前关闭数据库
+    db_close();
     return 0;
 }
