@@ -1,127 +1,133 @@
-/* 必须放在第一行 */
-#define _DEFAULT_SOURCE 
-#define _BSD_SOURCE
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
-#include <stdint.h>
-#include <signal.h> 
-#include "linux-hal.h"
-#include "SX1278.h"
-#include "db_manager.h" // 引入数据库头文件
+#include <unistd.h>
+#include <time.h>
+#include <sys/time.h>
 
-#define PIN_RESET  119 
-#define PIN_DIO0   116 
+#include "platform/linux-hal.h"
+#include "radio/SX1278.h"
+#include "database/db_manager.h"  // 确保你有这个文件，用于存数据库
+#include "app_lora_protocol.h"
 
-volatile int g_running = 1;
-uint32_t g_total_recv = 0;
-uint32_t g_total_lost = 0;
-uint32_t g_last_seq = 0;
-int      g_is_first = 1;
+// --- 全局变量 ---
+SX1278_hw_t sx1278_hw;
+SX1278_t sx1278;
 
-// --- [修正1] 唯一的信号处理函数 ---
-// 包含了数据库关闭逻辑，请确保文件中只有这一个 sig_handler
-void sig_handler(int signo) { 
-    if (signo == SIGINT) {
-        g_running = 0;
-        printf("\n[Info] Exiting... Closing DB.\n");
-        db_close(); 
+// 获取当前毫秒时间
+uint32_t Get_Current_Time_Ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+}
+
+// 处理接收到的数据
+void Process_LoRa_Packet(uint8_t *buffer, int len) {
+    if (len != sizeof(Node_Data_Frame_t)) return;
+
+    Node_Data_Frame_t *data = (Node_Data_Frame_t *)buffer;
+
+    // 1. 校验头和数据完整性
+    if (data->head != LORA_DATA_HEAD) return;
+    
+    // 简单校验和检查 (可选)
+    uint8_t sum = 0;
+    uint8_t *p = (uint8_t*)data;
+    for(int i=0; i<sizeof(Node_Data_Frame_t)-1; i++) {
+        sum += p[i];
+    }
+    if (sum != data->checksum) {
+        printf("[Warn] Checksum Error from ID %d\n", data->dev_id);
+        return;
+    }
+
+    // 2. 打印接收到的数据 (这就是你要截图放到论文里的效果！)
+    printf("\n[RX] 收到节点数据:\n");
+    printf("   + 设备 ID: %d\n", data->dev_id);
+    printf("   + 温    度: %.2f C\n", data->temperature);
+    printf("   + 湿    度: %.2f %%\n", data->humidity);
+    printf("   + PID 输出: %.2f\n", data->pid_output);
+
+    // 3. 存入 SQLite 数据库
+    // 假设你的 db_manager.c 里有这个函数，如果没有，需要去补充
+    char sql[256];
+    sprintf(sql, "INSERT INTO sensor_data (dev_id, temperature, humidity, pid_out, timestamp) VALUES (%d, %.2f, %.2f, %.2f, %ld);",
+            data->dev_id, data->temperature, data->humidity, data->pid_output, time(NULL));
+    
+    if (db_exec(sql) == 0) {
+        printf("   -> 数据已入库 (SQLite)\n");
+    } else {
+        printf("   -> [Error] 入库失败\n");
     }
 }
 
-int main() {
-    signal(SIGINT, sig_handler);
+int main(int argc, char *argv[]) {
+    printf("==========================================\n");
+    printf("   船舶冷箱 LoRa H-TDMA 网关启动 \n");
+    printf("==========================================\n");
 
-    // 初始化数据库
-    if (db_init("sensor_data.db") != 0) {
-        printf("[ERR] Database Init Failed!\n");
-        return -1;
+    // 1. 初始化数据库
+    if (db_init("reefer_data.db") != 0) {
+        printf("Error: DB Init failed\n");
+        // return -1; // 暂时不退出，方便调试 LoRa
     }
 
-    printf("\n=== LoRa Gateway (Manual Parsing Mode) ===\n");
-    printf("Expected Protocol: [AA] [ID] [T1 T2 T3 T4] [S1 S2 S3 S4] (10 Bytes)\n");
-    printf("------------------------------------------------------------\n");
+    // 2. 初始化 LoRa
+    // 注意：Linux 下 SPI 设备通常是 /dev/spidevX.X，在 SX1278_hw.c 里配置
+    SX1278_hw_init(&sx1278_hw); 
+SX1278_init(&sx1278, 433000000, SX1278_POWER_17DBM, 
+                SX1278_LORA_SF_7, SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_5, 
+                SX1278_LORA_CRC_EN, 10);
 
-    SX1278_hw_t sx1278_hw;
-    SX1278_t sx1278;
+    printf("[System] LoRa Init OK. Waiting for cycle...\n");
 
-    sx1278_hw.spi_fd = -1;
-    sx1278_hw.reset_pin = PIN_RESET;
-    sx1278_hw.dio0_pin = PIN_DIO0;
-    sx1278.hw = &sx1278_hw;
+    uint32_t cycle_start = 0;
+    uint8_t rx_buf[128];
+    int rx_len;
 
-    SX1278_init(&sx1278, 433000000, SX1278_POWER_17DBM, SX1278_LORA_SF_9,
-                SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 10);
+    // --- 主循环 (TDMA 调度器) ---
+    while (1) {
+        cycle_start = Get_Current_Time_Ms();
 
-    if (SX1278_SPIRead(&sx1278, 0x42) == 0x12) {
-        printf("✅ LoRa Init OK. Waiting for packets...\n");
-        SX1278_LoRaEntryRx(&sx1278, 10, 0);
+        // ------------------------------------
+        // 阶段 1: 广播 Beacon (同步所有节点)
+        // ------------------------------------
+        printf("\n[TDMA] >>> 新周期开始 (广播 Beacon) <<<\n");
+        
+        Beacon_Frame_t beacon;
+        memset(&beacon, 0, sizeof(beacon));
+        beacon.head = LORA_BEACON_HEAD;
+        beacon.net_id = LORA_NET_ID;
+        beacon.timestamp = (uint32_t)time(NULL); 
 
-        while(g_running) {
-            if (SX1278_hw_GetDIO0(&sx1278_hw)) {
-                uint8_t buf[64] = {0};
-                int len = SX1278_LoRaRxPacket(&sx1278);
-                SX1278_read(&sx1278, buf, len);
+        SX1278_LoRaEntryTx(&sx1278, sizeof(beacon), 2000);
+        SX1278_LoRaTxPacket(&sx1278, (uint8_t *)&beacon, sizeof(beacon), 2000);
+        
+        // ------------------------------------
+        // 阶段 2: 接收窗口 (收集数据)
+        // ------------------------------------
+        printf("[TDMA] 进入接收模式 (持续 %d ms)...\n", TDMA_CYCLE_TIME);
+        
+        // 切换到接收
+        SX1278_LoRaEntryRx(&sx1278, 16, 2000);
 
-                // 1. 基础校验
-                if (len == 10 && buf[0] == 0xAA) {
-                    
-                    // --- [修正2] 定义并提取 dev_id ---
-                    uint8_t dev_id = buf[1]; 
-
-                    float temp;
-                    memcpy(&temp, &buf[2], 4); 
-
-                    uint32_t seq = (uint32_t)buf[6] | 
-                                   ((uint32_t)buf[7] << 8) | 
-                                   ((uint32_t)buf[8] << 16) | 
-                                   ((uint32_t)buf[9] << 24);
-
-                    // --- 统计逻辑 ---
-                    if (g_is_first) {
-                        g_is_first = 0;
-                        g_last_seq = seq;
-                    } else {
-                        if (seq > g_last_seq + 1) {
-                            int lost = seq - g_last_seq - 1;
-                            g_total_lost += lost;
-                            printf("\n[WARN] Lost %d pkts (Seq %d -> %d)\n", lost, g_last_seq, seq);
-                        } 
-                        else if (seq < g_last_seq) {
-                            printf("\n[INFO] Device Restarted. Stats Reset.\n");
-                            g_total_lost = 0;
-                            g_total_recv = 0;
-                        }
-                        g_last_seq = seq;
-                    }
-                    g_total_recv++;
-
-                    // --- 仪表盘显示 ---
-                    float rate = 0;
-                    if(g_total_recv + g_total_lost > 0)
-                        rate = (float)g_total_lost / (g_total_recv + g_total_lost) * 100.0f;
-
-                    printf("\rSeq:%-5d | Temp:%-6.2f | Loss:%-3d (%.1f%%) | RAW: %02X %02X...  ", 
-                           seq, temp, g_total_lost, rate, buf[6], buf[7]);
-                    fflush(stdout);
-
-                    // --- 存入数据库 ---
-                    // 现在 dev_id 已经定义了，这里就不会报错了
-                    db_insert_data(dev_id, temp, seq, g_total_lost);
-
-                } else {
-                    printf("\n[ERR] Invalid Packet. Len:%d, Head:0x%02X\n", len, buf[0]);
-                }
+        // 在周期剩余时间内一直接收
+        while (Get_Current_Time_Ms() - cycle_start < TDMA_CYCLE_TIME) {
+            
+            // 轮询检查是否有数据
+            rx_len = SX1278_LoRaRxPacket(&sx1278);
+            
+            if (rx_len > 0) {
+                SX1278_read(&sx1278, rx_buf, rx_len);
+                Process_LoRa_Packet(rx_buf, rx_len);
                 
-                SX1278_LoRaEntryRx(&sx1278, 10, 0);
+                // 收完一个包，必须重新进入接收模式，准备收下一个
+                SX1278_LoRaEntryRx(&sx1278, 16, 2000);
             }
-            usleep(2000); 
+
+            usleep(5000); // 休息 5ms，避免 CPU 100%
         }
-    } 
-    
-    // 退出前关闭数据库
-    db_close();
+    }
+
     return 0;
 }

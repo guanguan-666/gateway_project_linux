@@ -12,4 +12,6 @@ int db_insert_data(uint8_t dev_id, float temp, uint32_t seq, uint32_t lost);
 // 关闭数据库
 void db_close(void);
 
+int db_exec(const char *sql);
+
 #endif
